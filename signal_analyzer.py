@@ -1,283 +1,354 @@
-import pandas as pd
-import numpy as np
-import ta
-import logging
+"""
+Technical-analysis signal generator for OTC / forex-style OHLC candles.
 
-logging.basicConfig(level=logging.INFO)
+Analysis only: it takes candles in and returns a signal dict. It does not
+fetch data, send alerts, place trades or manage risk.
+"""
+import logging
+from collections import deque
+
+import numpy as np
+import pandas as pd
+
 logger = logging.getLogger(__name__)
+
+# Indicator weights. A full set of agreeing indicators sums to 1.0.
+W_RSI = 0.25
+W_EMA = 0.30
+W_MACD = 0.20
+W_BB = 0.15
+W_VOLUME = 0.10
+
+# ---------------------------------------------------------------------------
+# Indicator helpers (pure pandas/numpy, so there is no dependency on the `ta`
+# package and no API-version mismatch)
+# ---------------------------------------------------------------------------
+
+
+def _ema(series, span):
+    return series.ewm(span=span, adjust=False, min_periods=span).mean()
+
+
+def _rsi(close, period):
+    """Wilder's RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = rsi.where(avg_loss != 0, 100.0)  # no losses -> 100
+    rsi = rsi.where(~((avg_loss == 0) & (avg_gain == 0)), 50.0)  # flat -> 50
+    return rsi
+
+
+def _atr(high, low, close, period):
+    """Wilder's Average True Range."""
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 class SignalAnalyzer:
     """
-    Technical Analysis Signal Generator
-    Uses multiple indicators for high-accuracy trading signals
+    Multi-indicator signal generator.
+
+    Scoring model
+    -------------
+    Each indicator adds its weight to a buy score or a sell score (0..1).
+    A BUY/SELL signal requires ALL of:
+      * winning score >= min_signal_strength (absolute, not a ratio)
+      * at least `min_agreeing` indicators voting for that side
+      * winning score leads the other side by at least `min_margin`
+    Anything weaker is WEAK_BUY / WEAK_SELL (direction is None, the leaning is
+    reported in `bias`). Equal scores give NEUTRAL.
     """
-    
-    def __init__(self, rsi_period=14, ema_fast=9, ema_slow=21, 
-                 macd_fast=12, macd_slow=26, macd_signal=9):
+
+    def __init__(self, rsi_period=14, ema_fast=9, ema_slow=21,
+                 macd_fast=12, macd_slow=26, macd_signal=9,
+                 bb_period=20, bb_std=2, atr_period=14, volume_period=20,
+                 history_size=500):
         self.rsi_period = rsi_period
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.macd_fast = macd_fast
         self.macd_slow = macd_slow
         self.macd_signal = macd_signal
-        self.signals_history = []
-        
+        self.bb_period = bb_period
+        self.bb_std = bb_std
+        self.atr_period = atr_period
+        self.volume_period = volume_period
+        self.signals_history = deque(maxlen=history_size)
+
+    @property
+    def min_candles(self):
+        """Candles needed so every indicator is valid on the last two rows."""
+        return max(
+            self.ema_slow,
+            self.macd_slow + self.macd_signal,
+            self.bb_period,
+            self.rsi_period + 1,
+            self.atr_period + 1,
+        ) + 1
+
+    # ------------------------------------------------------------------ data
     def prepare_data(self, ohlc_data):
-        """
-        Prepare OHLC data for analysis
-        
-        Args:
-            ohlc_data (list): List of OHLC candles
-            
-        Returns:
-            pd.DataFrame: DataFrame with OHLC data
-        """
+        """Return a clean, time-ordered DataFrame, or None if the data is unusable."""
         try:
             df = pd.DataFrame(ohlc_data)
-            df['close'] = pd.to_numeric(df['close'])
-            df['open'] = pd.to_numeric(df['open'])
-            df['high'] = pd.to_numeric(df['high'])
-            df['low'] = pd.to_numeric(df['low'])
-            df['volume'] = pd.to_numeric(df.get('volume', 0))
-            return df
-        except Exception as e:
-            logger.error(f"❌ Data preparation error: {str(e)}")
+            if df.empty:
+                return None
+            required = ['open', 'high', 'low', 'close']
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                logger.error("Missing OHLC columns: %s", missing)
+                return None
+            for col in required:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            if 'volume' in df.columns:
+                df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+            else:
+                df['volume'] = 0.0
+            for tcol in ('time', 'timestamp'):
+                if tcol in df.columns:
+                    df = df.drop_duplicates(subset=tcol, keep='last').sort_values(tcol)
+                    break
+            df = df.dropna(subset=required).reset_index(drop=True)
+            return df if len(df) else None
+        except Exception:
+            logger.exception("Data preparation error")
             return None
-    
+
+    # ------------------------------------------------------------ indicators
     def calculate_rsi(self, df):
-        """Calculate RSI indicator"""
-        try:
-            df['RSI'] = ta.momentum.rsi(df['close'], length=self.rsi_period)
-            return df
-        except Exception as e:
-            logger.error(f"❌ RSI calculation error: {str(e)}")
-            return df
-    
+        df['RSI'] = _rsi(df['close'], self.rsi_period)
+        return df
+
     def calculate_ema(self, df):
-        """Calculate Fast and Slow EMAs"""
-        try:
-            df['EMA_FAST'] = ta.trend.ema_indicator(df['close'], length=self.ema_fast)
-            df['EMA_SLOW'] = ta.trend.ema_indicator(df['close'], length=self.ema_slow)
-            return df
-        except Exception as e:
-            logger.error(f"❌ EMA calculation error: {str(e)}")
-            return df
-    
+        df['EMA_FAST'] = _ema(df['close'], self.ema_fast)
+        df['EMA_SLOW'] = _ema(df['close'], self.ema_slow)
+        return df
+
     def calculate_macd(self, df):
-        """Calculate MACD indicator"""
-        try:
-            macd = ta.trend.MACD(df['close'], 
-                                window_fast=self.macd_fast,
-                                window_slow=self.macd_slow,
-                                window_sign=self.macd_signal)
-            df['MACD'] = macd.macd()
-            df['MACD_SIGNAL'] = macd.macd_signal()
-            df['MACD_DIFF'] = macd.macd_diff()
-            return df
-        except Exception as e:
-            logger.error(f"❌ MACD calculation error: {str(e)}")
-            return df
-    
-    def calculate_bollinger_bands(self, df, period=20, std_dev=2):
-        """Calculate Bollinger Bands"""
-        try:
-            bb = ta.volatility.BollingerBands(df['close'], window=period, window_dev=std_dev)
-            df['BB_HIGH'] = bb.bollinger_hband()
-            df['BB_MID'] = bb.bollinger_mavg()
-            df['BB_LOW'] = bb.bollinger_lband()
-            return df
-        except Exception as e:
-            logger.error(f"❌ Bollinger Bands error: {str(e)}")
-            return df
-    
-    def calculate_atr(self, df, period=14):
-        """Calculate Average True Range (volatility)"""
-        try:
-            df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], length=period)
-            return df
-        except Exception as e:
-            logger.error(f"❌ ATR calculation error: {str(e)}")
-            return df
-    
+        macd = _ema(df['close'], self.macd_fast) - _ema(df['close'], self.macd_slow)
+        signal = macd.ewm(span=self.macd_signal, adjust=False,
+                          min_periods=self.macd_signal).mean()
+        df['MACD'] = macd
+        df['MACD_SIGNAL'] = signal
+        df['MACD_DIFF'] = macd - signal
+        return df
+
+    def calculate_bollinger_bands(self, df):
+        mid = df['close'].rolling(self.bb_period).mean()
+        std = df['close'].rolling(self.bb_period).std(ddof=0)
+        df['BB_MID'] = mid
+        df['BB_HIGH'] = mid + self.bb_std * std
+        df['BB_LOW'] = mid - self.bb_std * std
+        return df
+
+    def calculate_atr(self, df):
+        df['ATR'] = _atr(df['high'], df['low'], df['close'], self.atr_period)
+        return df
+
     def calculate_volume_signal(self, df):
-        """Calculate volume-based signals"""
-        try:
-            df['VOLUME_SMA'] = df['volume'].rolling(window=20).mean()
-            df['VOLUME_RATIO'] = df['volume'] / df['VOLUME_SMA']
+        """Volume ratio. NaN when the feed has no real volume (typical for OTC)."""
+        if df['volume'].nunique() <= 1:
+            df['VOLUME_RATIO'] = np.nan
             return df
-        except Exception as e:
-            logger.error(f"❌ Volume calculation error: {str(e)}")
-            return df
-    
-    def generate_signals(self, df, rsi_overbought=70, rsi_oversold=30, 
-                        min_signal_strength=0.75):
+        sma = df['volume'].rolling(self.volume_period).mean()
+        df['VOLUME_RATIO'] = (df['volume'] / sma.replace(0, np.nan))
+        return df
+
+    # --------------------------------------------------------------- signals
+    @staticmethod
+    def _result(signal='NEUTRAL', direction=None, bias=None, strength=0.0,
+                components=None, buy_score=0.0, sell_score=0.0, **extra):
+        """Every return path uses this, so the output schema is always the same."""
+        result = {
+            'signal': signal,
+            'direction': direction,
+            'bias': bias,
+            'strength': round(float(strength), 3),
+            'buy_score': round(float(buy_score), 3),
+            'sell_score': round(float(sell_score), 3),
+            'components': components or {},
+            'current_price': None,
+            'rsi': None,
+            'ema_fast': None,
+            'ema_slow': None,
+            'atr': None,
+        }
+        result.update(extra)
+        return result
+
+    def generate_signals(self, df, rsi_overbought=70, rsi_oversold=30,
+                         min_signal_strength=0.5, min_agreeing=2,
+                         min_margin=0.2, min_atr_pct=0.0):
         """
-        Generate buy/sell signals based on multiple indicators
-        
+        Score the last two candles of an indicator-enriched DataFrame.
+
         Args:
-            df (pd.DataFrame): DataFrame with calculated indicators
-            rsi_overbought (int): RSI overbought level
-            rsi_oversold (int): RSI oversold level
-            min_signal_strength (float): Minimum signal strength (0-1)
-            
-        Returns:
-            dict: Signal data with direction and strength
+            min_signal_strength: minimum absolute score (0-1) of the winning side.
+            min_agreeing: minimum number of indicators voting for the winner.
+            min_margin: minimum score lead over the opposite side.
+            min_atr_pct: skip when ATR/close is below this (0 disables the filter).
+        """
+        cols = ['RSI', 'EMA_FAST', 'EMA_SLOW', 'MACD', 'MACD_SIGNAL',
+                'BB_LOW', 'BB_HIGH', 'ATR']
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            return self._result('ERROR', components={'error': f'missing columns: {missing}'})
+        if len(df) < 2:
+            return self._result('INSUFFICIENT_DATA', components={'reason': 'need 2+ candles'})
+
+        cur, prev = df.iloc[-1], df.iloc[-2]
+        if cur[cols].isna().any() or prev[cols].isna().any():
+            return self._result('INSUFFICIENT_DATA',
+                                components={'reason': 'indicators not warmed up (NaN)'})
+
+        scores = {'buy': 0.0, 'sell': 0.0}
+        votes = {'buy': 0, 'sell': 0}
+        comp = {}
+
+        def vote(side, weight):
+            scores[side] += weight
+            votes[side] += 1
+
+        # RSI (mean reversion)
+        if cur['RSI'] < rsi_oversold:
+            vote('buy', W_RSI)
+            comp['RSI'] = 'OVERSOLD (BUY)'
+        elif cur['RSI'] > rsi_overbought:
+            vote('sell', W_RSI)
+            comp['RSI'] = 'OVERBOUGHT (SELL)'
+        else:
+            comp['RSI'] = 'NEUTRAL'
+
+        # EMA: a fresh cross gets full weight, an existing trend half weight
+        if cur['EMA_FAST'] > cur['EMA_SLOW']:
+            crossed = prev['EMA_FAST'] <= prev['EMA_SLOW']
+            vote('buy', W_EMA if crossed else W_EMA / 2)
+            comp['EMA'] = 'BULLISH CROSSOVER' if crossed else 'BULLISH TREND'
+        elif cur['EMA_FAST'] < cur['EMA_SLOW']:
+            crossed = prev['EMA_FAST'] >= prev['EMA_SLOW']
+            vote('sell', W_EMA if crossed else W_EMA / 2)
+            comp['EMA'] = 'BEARISH CROSSOVER' if crossed else 'BEARISH TREND'
+        else:
+            comp['EMA'] = 'FLAT'
+
+        # MACD: same full/half logic
+        if cur['MACD'] > cur['MACD_SIGNAL']:
+            crossed = prev['MACD'] <= prev['MACD_SIGNAL']
+            vote('buy', W_MACD if crossed else W_MACD / 2)
+            comp['MACD'] = 'BULLISH CROSSOVER' if crossed else 'BULLISH TREND'
+        elif cur['MACD'] < cur['MACD_SIGNAL']:
+            crossed = prev['MACD'] >= prev['MACD_SIGNAL']
+            vote('sell', W_MACD if crossed else W_MACD / 2)
+            comp['MACD'] = 'BEARISH CROSSOVER' if crossed else 'BEARISH TREND'
+        else:
+            comp['MACD'] = 'FLAT'
+
+        # Bollinger Bands (mean reversion)
+        if cur['close'] < cur['BB_LOW']:
+            vote('buy', W_BB)
+            comp['BB'] = 'BELOW LOWER BAND (BUY)'
+        elif cur['close'] > cur['BB_HIGH']:
+            vote('sell', W_BB)
+            comp['BB'] = 'ABOVE UPPER BAND (SELL)'
+        else:
+            comp['BB'] = 'WITHIN BANDS'
+
+        # Volume (only when the feed actually has volume)
+        vol_ratio = cur['VOLUME_RATIO'] if 'VOLUME_RATIO' in df.columns else np.nan
+        if pd.isna(vol_ratio):
+            comp['VOLUME'] = 'N/A (no volume data)'
+        elif vol_ratio > 1.5 and cur['close'] != prev['close']:
+            if cur['close'] > prev['close']:
+                vote('buy', W_VOLUME)
+                comp['VOLUME'] = 'HIGH VOLUME UP'
+            else:
+                vote('sell', W_VOLUME)
+                comp['VOLUME'] = 'HIGH VOLUME DOWN'
+        else:
+            comp['VOLUME'] = 'NORMAL VOLUME'
+
+        buy_score = round(scores['buy'], 6)
+        sell_score = round(scores['sell'], 6)
+        info = dict(
+            current_price=round(float(cur['close']), 5),
+            rsi=round(float(cur['RSI']), 2),
+            ema_fast=round(float(cur['EMA_FAST']), 5),
+            ema_slow=round(float(cur['EMA_SLOW']), 5),
+            atr=round(float(cur['ATR']), 6),
+        )
+
+        if min_atr_pct > 0 and cur['close'] > 0 and cur['ATR'] / cur['close'] < min_atr_pct:
+            comp['FILTER'] = 'LOW VOLATILITY'
+            return self._result('NEUTRAL', components=comp, buy_score=buy_score,
+                                sell_score=sell_score, **info)
+
+        if buy_score == sell_score:  # includes 0 == 0
+            return self._result('NEUTRAL', components=comp, buy_score=buy_score,
+                                sell_score=sell_score, **info)
+
+        side = 'buy' if buy_score > sell_score else 'sell'
+        win, lose = (buy_score, sell_score) if side == 'buy' else (sell_score, buy_score)
+        qualifies = (win >= min_signal_strength
+                     and votes[side] >= min_agreeing
+                     and round(win - lose, 6) >= min_margin)
+
+        label = side.upper()
+        bias = 'CALL' if side == 'buy' else 'PUT'
+        return self._result(
+            signal=label if qualifies else f'WEAK_{label}',
+            direction=bias if qualifies else None,
+            bias=bias,
+            strength=win,
+            components=comp,
+            buy_score=buy_score,
+            sell_score=sell_score,
+            **info,
+        )
+
+    # -------------------------------------------------------------- pipeline
+    def analyze(self, ohlc_data, asset_name="ASSET", drop_last_candle=False, **kwargs):
+        """
+        Full pipeline: candles in, signal dict out.
+
+        Args:
+            ohlc_data: list of dicts with open/high/low/close (+ optional
+                volume and time/timestamp), oldest first or sortable by time.
+            drop_last_candle: set True if the last candle is still forming, so
+                the signal is computed on closed candles only (avoids repainting).
+            **kwargs: forwarded to generate_signals().
         """
         try:
-            current = df.iloc[-1]
-            previous = df.iloc[-2] if len(df) > 1 else None
-            
-            # Initialize signal scores
-            buy_score = 0
-            sell_score = 0
-            signal_components = {}
-            
-            # ========== RSI SIGNALS ==========
-            if current['RSI'] < rsi_oversold:
-                buy_score += 0.25
-                signal_components['RSI'] = 'OVERSOLD (BUY)'
-            elif current['RSI'] > rsi_overbought:
-                sell_score += 0.25
-                signal_components['RSI'] = 'OVERBOUGHT (SELL)'
-            else:
-                signal_components['RSI'] = 'NEUTRAL'
-            
-            # ========== EMA CROSSOVER SIGNALS ==========
-            if previous is not None:
-                # Fast EMA above Slow EMA = Bullish
-                if current['EMA_FAST'] > current['EMA_SLOW'] and \
-                   previous['EMA_FAST'] <= previous['EMA_SLOW']:
-                    buy_score += 0.30
-                    signal_components['EMA'] = 'BULLISH CROSSOVER'
-                
-                # Fast EMA below Slow EMA = Bearish
-                elif current['EMA_FAST'] < current['EMA_SLOW'] and \
-                     previous['EMA_FAST'] >= previous['EMA_SLOW']:
-                    sell_score += 0.30
-                    signal_components['EMA'] = 'BEARISH CROSSOVER'
-                else:
-                    signal_components['EMA'] = 'NO CROSSOVER'
-            
-            # ========== MACD SIGNALS ==========
-            if previous is not None:
-                # MACD bullish crossover
-                if current['MACD'] > current['MACD_SIGNAL'] and \
-                   previous['MACD'] <= previous['MACD_SIGNAL']:
-                    buy_score += 0.20
-                    signal_components['MACD'] = 'BULLISH CROSSOVER'
-                
-                # MACD bearish crossover
-                elif current['MACD'] < current['MACD_SIGNAL'] and \
-                     previous['MACD'] >= previous['MACD_SIGNAL']:
-                    sell_score += 0.20
-                    signal_components['MACD'] = 'BEARISH CROSSOVER'
-                else:
-                    signal_components['MACD'] = 'NO CROSSOVER'
-            
-            # ========== BOLLINGER BANDS SIGNALS ==========
-            if current['close'] < current['BB_LOW']:
-                buy_score += 0.15
-                signal_components['BB'] = 'BELOW LOWER BAND (BUY)'
-            elif current['close'] > current['BB_HIGH']:
-                sell_score += 0.15
-                signal_components['BB'] = 'ABOVE UPPER BAND (SELL)'
-            else:
-                signal_components['BB'] = 'WITHIN BANDS'
-            
-            # ========== VOLUME SIGNALS ==========
-            if current['VOLUME_RATIO'] > 1.5:
-                if current['close'] > previous['close']:
-                    buy_score += 0.10
-                    signal_components['VOLUME'] = 'HIGH VOLUME UP'
-                else:
-                    sell_score += 0.10
-                    signal_components['VOLUME'] = 'HIGH VOLUME DOWN'
-            else:
-                signal_components['VOLUME'] = 'NORMAL VOLUME'
-            
-            # ========== DETERMINE FINAL SIGNAL ==========
-            total_score = buy_score + sell_score
-            
-            if total_score == 0:
-                return {
-                    'signal': 'NEUTRAL',
-                    'direction': None,
-                    'strength': 0,
-                    'components': signal_components,
-                    'buy_score': 0,
-                    'sell_score': 0
-                }
-            
-            buy_strength = buy_score / total_score if total_score > 0 else 0
-            sell_strength = sell_score / total_score if total_score > 0 else 0
-            
-            if buy_strength > sell_strength:
-                signal = 'BUY' if buy_strength >= min_signal_strength else 'WEAK_BUY'
-                direction = 'CALL'
-                strength = buy_strength
-            else:
-                signal = 'SELL' if sell_strength >= min_signal_strength else 'WEAK_SELL'
-                direction = 'PUT'
-                strength = sell_strength
-            
-            return {
-                'signal': signal,
-                'direction': direction,
-                'strength': round(strength, 3),
-                'components': signal_components,
-                'buy_score': round(buy_score, 3),
-                'sell_score': round(sell_score, 3),
-                'current_price': round(current['close'], 4),
-                'rsi': round(current['RSI'], 2),
-                'ema_fast': round(current['EMA_FAST'], 4),
-                'ema_slow': round(current['EMA_SLOW'], 4)
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Signal generation error: {str(e)}")
-            return {
-                'signal': 'ERROR',
-                'direction': None,
-                'strength': 0,
-                'components': {'error': str(e)}
-            }
-    
-    def analyze(self, ohlc_data, asset_name="ASSET", **kwargs):
-        """
-        Complete analysis pipeline
-        
-        Args:
-            ohlc_data (list): OHLC data
-            asset_name (str): Asset identifier
-            
-        Returns:
-            dict: Complete signal analysis
-        """
-        try:
-            # Prepare data
             df = self.prepare_data(ohlc_data)
-            if df is None or len(df) < self.ema_slow:
-                return {'signal': 'INSUFFICIENT_DATA', 'asset': asset_name}
-            
-            # Calculate all indicators
-            df = self.calculate_rsi(df)
-            df = self.calculate_ema(df)
-            df = self.calculate_macd(df)
-            df = self.calculate_bollinger_bands(df)
-            df = self.calculate_atr(df)
-            df = self.calculate_volume_signal(df)
-            
-            # Generate signals
-            signal_result = self.generate_signals(df, **kwargs)
-            signal_result['asset'] = asset_name
-            signal_result['timestamp'] = pd.Timestamp.now().isoformat()
-            
-            # Store in history
-            self.signals_history.append(signal_result)
-            
-            return signal_result
-            
+            if df is None:
+                result = self._result('ERROR', components={'error': 'invalid OHLC data'})
+            else:
+                if drop_last_candle:
+                    df = df.iloc[:-1].reset_index(drop=True)
+                if len(df) < self.min_candles:
+                    result = self._result(
+                        'INSUFFICIENT_DATA',
+                        components={'have': len(df), 'need': self.min_candles})
+                else:
+                    df = self.calculate_rsi(df)
+                    df = self.calculate_ema(df)
+                    df = self.calculate_macd(df)
+                    df = self.calculate_bollinger_bands(df)
+                    df = self.calculate_atr(df)
+                    df = self.calculate_volume_signal(df)
+                    result = self.generate_signals(df, **kwargs)
         except Exception as e:
-            logger.error(f"❌ Analysis error for {asset_name}: {str(e)}")
-            return {'signal': 'ERROR', 'asset': asset_name, 'error': str(e)}
+            logger.exception("Analysis error for %s", asset_name)
+            result = self._result('ERROR', components={'error': str(e)})
+
+        result['asset'] = asset_name
+        result['timestamp'] = pd.Timestamp.now().isoformat()
+        self.signals_history.append(result)
+        return result
