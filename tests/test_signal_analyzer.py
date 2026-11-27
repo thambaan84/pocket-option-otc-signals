@@ -161,6 +161,131 @@ def test_history_is_capped():
     assert len(a.signals_history) == 5
 
 
+# ---------------------------------------------------------------------------
+# Validation and ATR tests
+# ---------------------------------------------------------------------------
+
+def candle(o=1.0, h=1.1, l=0.9, c=1.05):
+    return {'open': o, 'high': h, 'low': l, 'close': c}
+
+
+def series_with(index, **overrides):
+    """120 valid candles with one field of one candle overridden."""
+    candles = make_candles()
+    candles[index] = {**candles[index], **overrides}
+    return candles
+
+
+def test_missing_close_column_is_an_error():
+    df = make_df().drop(columns=['close'])
+    res = SignalAnalyzer().generate_signals(df)
+    assert res['signal'] == 'ERROR' and res['direction'] is None
+    assert 'close' in res['components']['error']
+    assert SCHEMA - {'asset', 'timestamp'} <= set(res)  # schema unchanged
+
+
+def test_missing_close_in_input_candles_is_rejected():
+    candles = [{k: v for k, v in c.items() if k != 'close'} for c in make_candles()]
+    a = SignalAnalyzer()
+    assert a.prepare_data(candles) is None
+    assert a.analyze(candles)['signal'] == 'ERROR'
+
+
+def test_infinity_in_any_ohlc_field_is_rejected():
+    a = SignalAnalyzer()
+    for field in ('open', 'high', 'low', 'close'):
+        for bad in (float('inf'), float('-inf')):
+            candles = series_with(60, **{field: bad})
+            assert a.prepare_data(candles) is None, (field, bad)
+            res = a.analyze(candles)
+            assert res['signal'] == 'ERROR', (field, bad, res)
+            assert res['direction'] is None
+
+
+def test_nan_and_unparseable_values_are_rejected_not_dropped():
+    a = SignalAnalyzer()
+    for field in ('open', 'high', 'low', 'close'):
+        for bad in (float('nan'), None, 'abc'):
+            candles = series_with(60, **{field: bad})
+            assert a.prepare_data(candles) is None, (field, bad)
+            assert a.analyze(candles)['signal'] == 'ERROR', (field, bad)
+
+
+def test_invalid_ohlc_relationships_are_rejected():
+    a = SignalAnalyzer()
+    bad_candles = {
+        'high below low': candle(o=1.0, h=0.8, l=0.9, c=0.85),
+        'high below open': candle(o=1.2, h=1.1, l=0.9, c=1.0),
+        'high below close': candle(o=1.0, h=1.1, l=0.9, c=1.2),
+        'low above open': candle(o=0.8, h=1.1, l=0.9, c=1.0),
+        'low above close': candle(o=1.0, h=1.1, l=0.9, c=0.8),
+    }
+    for name, bad in bad_candles.items():
+        candles = make_candles()
+        candles[60] = {**candles[60], **bad}
+        assert a.prepare_data(candles) is None, name
+        assert a.analyze(candles)['signal'] == 'ERROR', name
+
+
+def test_zero_and_negative_prices_are_rejected():
+    a = SignalAnalyzer()
+    for field in ('open', 'high', 'low', 'close'):
+        for bad in (0.0, -1.0):
+            candles = series_with(60, **{field: bad})
+            assert a.prepare_data(candles) is None, (field, bad)
+            assert a.analyze(candles)['signal'] == 'ERROR', (field, bad)
+
+
+def test_valid_candles_still_work():
+    a = SignalAnalyzer()
+    candles = make_candles()
+    df = a.prepare_data(candles)
+    assert df is not None and len(df) == len(candles)
+    res = a.analyze(candles, 'EURUSD_otc')
+    assert res['signal'] in {'BUY', 'SELL', 'WEAK_BUY', 'WEAK_SELL', 'NEUTRAL'}, res
+    assert SCHEMA <= set(res)
+    assert res['atr'] is not None and res['atr'] > 0
+    # numeric strings are still accepted
+    as_text = [{k: (str(v) if k != 'time' else v) for k, v in c.items()} for c in candles]
+    assert a.prepare_data(as_text) is not None
+    # flat (doji) candles where open == high == low == close are valid
+    assert a.prepare_data([candle(1.0, 1.0, 1.0, 1.0)] * 3) is not None
+
+
+def test_atr_matches_hand_calculated_wilder_reference():
+    # period 3. True ranges (first candle uses high - low; the rest use prev close):
+    #   c1 H12 L9           -> TR 3
+    #   c2 H14 L9  (pc 11)  -> max(5, |14-11|=3, |9-11|=2)  = 5
+    #   c3 H15 L11 (pc 12)  -> max(4, |15-12|=3, |11-12|=1) = 4
+    #   c4 H18 L16 (pc 14)  -> max(2, |18-14|=4, |16-14|=2) = 4   (gap up)
+    #   c5 H21 L15 (pc 17)  -> max(6, |21-17|=4, |15-17|=2) = 6
+    # Wilder: ATR[2] = (3+5+4)/3 = 4.0 (simple-average seed)
+    #         ATR[3] = (4.0*2 + 4)/3 = 4.0
+    #         ATR[4] = (4.0*2 + 6)/3 = 14/3
+    # (an EMA seeded from the first TR would give 3.7778 at index 2, not 4.0)
+    candles = [
+        candle(10, 12, 9, 11),
+        candle(11, 14, 9, 12),
+        candle(12, 15, 11, 14),
+        candle(17, 18, 16, 17),
+        candle(17, 21, 15, 19),
+    ]
+    a = SignalAnalyzer(atr_period=3)
+    df = a.calculate_atr(a.prepare_data(candles))
+    atr = df['ATR'].tolist()
+    print('ATR reference values:', atr)
+    assert np.isnan(atr[0]) and np.isnan(atr[1])
+    assert abs(atr[2] - 4.0) < 1e-12
+    assert abs(atr[3] - 4.0) < 1e-12
+    assert abs(atr[4] - 14 / 3) < 1e-12
+
+
+def test_atr_needs_a_full_period_before_first_value():
+    a = SignalAnalyzer(atr_period=3)
+    df = a.calculate_atr(a.prepare_data([candle(), candle()]))
+    assert df['ATR'].isna().all()
+
+
 if __name__ == '__main__':
     failed = 0
     for name, fn in sorted(globals().items()):

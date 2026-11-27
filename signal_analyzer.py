@@ -44,12 +44,25 @@ def _rsi(close, period):
 
 
 def _atr(high, low, close, period):
-    """Wilder's Average True Range."""
+    """
+    Standard Wilder ATR.
+
+    True range of the first candle is high - low (no previous close). The first
+    ATR value (at index period - 1) is the simple average of the first `period`
+    true ranges; after that ATR = (previous ATR * (period - 1) + TR) / period.
+    Earlier rows are NaN.
+    """
     prev_close = close.shift(1)
     true_range = pd.concat(
         [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
     ).max(axis=1)
-    return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    tr = true_range.to_numpy(dtype=float)
+    atr = np.full(len(tr), np.nan)
+    if len(tr) >= period:
+        atr[period - 1] = tr[:period].mean()
+        for i in range(period, len(tr)):
+            atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return pd.Series(atr, index=close.index)
 
 
 class SignalAnalyzer:
@@ -95,8 +108,29 @@ class SignalAnalyzer:
         ) + 1
 
     # ------------------------------------------------------------------ data
+    @staticmethod
+    def _ohlc_problem(df):
+        """Return a description of the first OHLC problem found, or None if valid."""
+        o, h, l, c = (df[col].to_numpy(dtype=float)
+                      for col in ('open', 'high', 'low', 'close'))
+        values = np.concatenate([o, h, l, c])
+        if not np.isfinite(values).all():
+            return 'non-finite value (NaN or infinity) in OHLC'
+        if (values <= 0).any():
+            return 'non-positive price in OHLC'
+        if (h < l).any() or (h < o).any() or (h < c).any() \
+                or (l > o).any() or (l > c).any():
+            return 'invalid candle (need low <= open/close <= high)'
+        return None
+
     def prepare_data(self, ohlc_data):
-        """Return a clean, time-ordered DataFrame, or None if the data is unusable."""
+        """
+        Return a clean, time-ordered DataFrame, or None if the data is unusable.
+
+        The whole input is rejected (None) if any candle has a NaN/infinite or
+        non-positive price, or an impossible shape (high below low/open/close,
+        or low above open/close). Candles are never silently dropped or repaired.
+        """
         try:
             df = pd.DataFrame(ohlc_data)
             if df.empty:
@@ -108,6 +142,10 @@ class SignalAnalyzer:
                 return None
             for col in required:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+            problem = self._ohlc_problem(df)
+            if problem:
+                logger.error("Invalid OHLC data: %s", problem)
+                return None
             if 'volume' in df.columns:
                 df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
             else:
@@ -116,8 +154,7 @@ class SignalAnalyzer:
                 if tcol in df.columns:
                     df = df.drop_duplicates(subset=tcol, keep='last').sort_values(tcol)
                     break
-            df = df.dropna(subset=required).reset_index(drop=True)
-            return df if len(df) else None
+            return df.reset_index(drop=True)
         except Exception:
             logger.exception("Data preparation error")
             return None
@@ -196,7 +233,7 @@ class SignalAnalyzer:
             min_margin: minimum score lead over the opposite side.
             min_atr_pct: skip when ATR/close is below this (0 disables the filter).
         """
-        cols = ['RSI', 'EMA_FAST', 'EMA_SLOW', 'MACD', 'MACD_SIGNAL',
+        cols = ['close', 'RSI', 'EMA_FAST', 'EMA_SLOW', 'MACD', 'MACD_SIGNAL',
                 'BB_LOW', 'BB_HIGH', 'ATR']
         missing = [c for c in cols if c not in df.columns]
         if missing:
