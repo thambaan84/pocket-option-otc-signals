@@ -30,7 +30,22 @@ def _ema(series, span):
 
 
 def _rsi(close, period):
-    """Wilder's RSI."""
+    """
+    RSI from recursive exponentially weighted averages of gains and losses.
+
+    This is NOT the conventional SMA-seeded Wilder RSI. Exactly what it does:
+      * gain / loss are the positive / negative parts of close.diff(); row 0 has
+        no price change, so it is NaN.
+      * avg_gain and avg_loss are pandas ewm(alpha=1/period, adjust=False) means.
+        The recursion avg = (1 - alpha) * previous avg + alpha * x is initialised
+        from the first observed gain/loss (row 1), not from the simple average
+        of the first `period` changes.
+      * min_periods=period hides the averages (NaN) until `period` changes have
+        been observed, so the first RSI value is at row index `period`.
+      * RSI = 100 - 100 / (1 + avg_gain / avg_loss).
+      * Special cases: avg_loss == 0 gives 100; if avg_gain is also 0 (flat
+        market) the result is the neutral value 50.
+    """
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
