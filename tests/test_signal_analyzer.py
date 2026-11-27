@@ -382,6 +382,212 @@ def test_default_configuration_still_works():
     assert res['signal'] != 'ERROR' and SCHEMA <= set(res), res
 
 
+# ---------------------------------------------------------------------------
+# Independent indicator reference tests
+#
+# Every expected value below was derived by hand from the textbook definition
+# (arithmetic shown in the comments) on small, fixed, deterministic data. None
+# of it is computed by calling the code under test or a copy of it. These
+# tests pin down the CURRENT behaviour; they do not claim the indicators have
+# any predictive value.
+# ---------------------------------------------------------------------------
+
+def candles_from_closes(closes, volumes=None):
+    """Valid OHLC candles around fixed closes (high/low = close +/- 0.5)."""
+    out = []
+    for i, c in enumerate(closes):
+        row = {'time': i, 'open': c, 'high': c + 0.5, 'low': c - 0.5, 'close': c}
+        if volumes is not None:
+            row['volume'] = volumes[i]
+        out.append(row)
+    return out
+
+
+def run_indicators(analyzer, candles):
+    df = analyzer.prepare_data(candles)
+    assert df is not None
+    for step in (analyzer.calculate_rsi, analyzer.calculate_ema,
+                 analyzer.calculate_macd, analyzer.calculate_bollinger_bands,
+                 analyzer.calculate_atr, analyzer.calculate_volume_signal):
+        df = step(df)
+    return df
+
+
+def assert_series(series, expected, tol=1e-9, label=''):
+    """expected: list of floats, with None meaning 'must be NaN'."""
+    got = series.tolist()
+    assert len(got) == len(expected), (label, got)
+    for i, (g, e) in enumerate(zip(got, expected)):
+        if e is None:
+            assert np.isnan(g), (label, i, g, 'expected NaN')
+        else:
+            assert not np.isnan(g) and abs(g - e) <= tol, (label, i, g, e)
+
+
+def test_ema_matches_hand_calculated_reference():
+    # closes 2, 4, 8, 6, 10. EMA = alpha*close + (1-alpha)*previous EMA with
+    # alpha = 2/(span+1), seeded with the first close; the first span-1 rows are NaN.
+    # span 2 (alpha 2/3): y1 = 2/3*4 + 1/3*2      = 10/3
+    #                     y2 = 2/3*8 + 1/3*10/3   = 58/9
+    #                     y3 = 2/3*6 + 1/3*58/9   = 166/27
+    #                     y4 = 2/3*10 + 1/3*166/27 = 706/81
+    # span 3 (alpha 1/2): 2, 3, 11/2, 23/4, 63/8
+    a = SignalAnalyzer(ema_fast=2, ema_slow=3)
+    df = run_indicators(a, candles_from_closes([2, 4, 8, 6, 10]))
+    assert_series(df['EMA_FAST'], [None, 10 / 3, 58 / 9, 166 / 27, 706 / 81], label='EMA_FAST')
+    assert_series(df['EMA_SLOW'], [None, None, 11 / 2, 23 / 4, 63 / 8], label='EMA_SLOW')
+
+
+def test_rsi_matches_hand_calculated_wilder_reference():
+    # period 3 (Wilder alpha = 1/3), closes 10, 12, 11, 14, 13, 11
+    # change      -    +2   -1   +3   -1   -2
+    # avg_gain    -    2    4/3  17/9 34/27 68/81   (new = 2/3*old + 1/3*gain)
+    # avg_loss    -    0    1/3  2/9  13/27 80/81   (new = 2/3*old + 1/3*loss)
+    # RSI = 100 * avg_gain / (avg_gain + avg_loss), first value once 3 changes exist
+    #   idx3: 100*17/19 = 1700/19    idx4: 100*34/47 = 3400/47    idx5: 100*68/148 = 1700/37
+    a = SignalAnalyzer(rsi_period=3)
+    df = run_indicators(a, candles_from_closes([10, 12, 11, 14, 13, 11]))
+    assert_series(df['RSI'], [None, None, None, 1700 / 19, 3400 / 47, 1700 / 37], label='RSI')
+
+
+def test_rsi_flat_market_is_50():
+    # DOCUMENTED EXISTING BEHAVIOUR: when every change is zero, avg_gain and
+    # avg_loss are both 0, RS is undefined, and _rsi deliberately returns the
+    # neutral value 50 (not NaN, not 0 and not 100). Warm-up is unchanged: the
+    # first `period` rows are still NaN.
+    a = SignalAnalyzer(rsi_period=3)
+    df = run_indicators(a, candles_from_closes([10] * 8))
+    assert_series(df['RSI'], [None, None, None, 50.0, 50.0, 50.0, 50.0, 50.0],
+                  tol=0, label='RSI flat')
+
+
+def test_rsi_keeps_last_value_when_market_turns_flat_after_movement():
+    # DOCUMENTED EXISTING BEHAVIOUR: after a flat stretch that FOLLOWS movement,
+    # avg_gain and avg_loss both decay by the same factor (2/3 per flat bar), so
+    # their ratio, and therefore RSI, stays at its last value. It does not
+    # return to 50. Example: 10, 12, 11, 14, 13, 11, then 11, 11.
+    #   idx6: avg_gain 136/243, avg_loss 160/243 -> 100*136/296 = 1700/37 (unchanged)
+    a = SignalAnalyzer(rsi_period=3)
+    df = run_indicators(a, candles_from_closes([10, 12, 11, 14, 13, 11, 11, 11]))
+    last = 1700 / 37
+    assert_series(df['RSI'], [None, None, None, 1700 / 19, 3400 / 47, last, last, last],
+                  label='RSI stale after flat')
+
+
+def test_rsi_rising_is_100_and_falling_is_0():
+    # no losses -> 100 ; no gains -> RS = 0 -> 100 - 100/(1+0) = 0
+    a = SignalAnalyzer(rsi_period=3)
+    up = run_indicators(a, candles_from_closes([10, 11, 12, 13, 14, 15]))
+    assert_series(up['RSI'], [None, None, None, 100.0, 100.0, 100.0], tol=0, label='RSI up')
+    down = run_indicators(a, candles_from_closes([15, 14, 13, 12, 11, 10]))
+    assert_series(down['RSI'], [None, None, None, 0.0, 0.0, 0.0], tol=0, label='RSI down')
+
+
+def test_macd_matches_hand_calculated_reference():
+    # fast 2, slow 3, signal 2 on closes 2, 4, 8, 6, 10 (EMA values as in the EMA test)
+    # MACD = EMA2 - EMA3   (NaN until both exist, i.e. from idx2)
+    #   idx2: 58/9 - 11/2    = 17/18
+    #   idx3: 166/27 - 23/4  = 43/108
+    #   idx4: 706/81 - 63/8  = 545/648
+    # SIGNAL = EMA(span 2, alpha 2/3) of MACD, needs 2 MACD values -> from idx3
+    #   idx3: 2/3*43/108 + 1/3*17/18    = 47/81
+    #   idx4: 2/3*545/648 + 1/3*47/81   = 733/972
+    # DIFF = MACD - SIGNAL
+    #   idx3: 43/108 - 47/81 = -59/324     idx4: 545/648 - 733/972 = 169/1944
+    a = SignalAnalyzer(macd_fast=2, macd_slow=3, macd_signal=2)
+    df = run_indicators(a, candles_from_closes([2, 4, 8, 6, 10]))
+    assert_series(df['MACD'], [None, None, 17 / 18, 43 / 108, 545 / 648], label='MACD')
+    assert_series(df['MACD_SIGNAL'], [None, None, None, 47 / 81, 733 / 972], label='MACD_SIGNAL')
+    assert_series(df['MACD_DIFF'], [None, None, None, -59 / 324, 169 / 1944], label='MACD_DIFF')
+
+
+def test_bollinger_bands_match_hand_calculated_reference():
+    # period 4, closes 2, 2, 6, 6, 10, 10. Population standard deviation (ddof=0).
+    #   idx3 window 2,2,6,6   : mean 4, variance 16/4 = 4 , std 2
+    #   idx4 window 2,6,6,10  : mean 6, variance 32/4 = 8 , std 2*sqrt(2)
+    #   idx5 window 6,6,10,10 : mean 8, variance 16/4 = 4 , std 2
+    # bands = mean +/- k*std. (A sample std, ddof=1, would give 2.309 at idx3.)
+    r2 = np.sqrt(2)
+    a = SignalAnalyzer(bb_period=4, bb_std=2)
+    df = run_indicators(a, candles_from_closes([2, 2, 6, 6, 10, 10]))
+    assert_series(df['BB_MID'], [None, None, None, 4, 6, 8], label='BB_MID')
+    assert_series(df['BB_HIGH'], [None, None, None, 8, 6 + 4 * r2, 12], label='BB_HIGH k=2')
+    assert_series(df['BB_LOW'], [None, None, None, 0, 6 - 4 * r2, 4], label='BB_LOW k=2')
+    # custom multiplier k = 1.5
+    b = SignalAnalyzer(bb_period=4, bb_std=1.5)
+    df = run_indicators(b, candles_from_closes([2, 2, 6, 6, 10, 10]))
+    assert_series(df['BB_HIGH'], [None, None, None, 7, 6 + 3 * r2, 11], label='BB_HIGH k=1.5')
+    assert_series(df['BB_LOW'], [None, None, None, 1, 6 - 3 * r2, 5], label='BB_LOW k=1.5')
+
+
+def test_volume_ratio_matches_hand_calculated_reference():
+    # period 3, volumes 100, 200, 300, 600, 300 ; ratio = volume / rolling mean
+    #   idx2: mean 200            -> 300/200 = 1.5
+    #   idx3: mean 1100/3         -> 600*3/1100 = 18/11
+    #   idx4: mean 400            -> 300/400 = 0.75
+    a = SignalAnalyzer(volume_period=3)
+    df = run_indicators(a, candles_from_closes([10, 11, 12, 13, 14], [100, 200, 300, 600, 300]))
+    assert_series(df['VOLUME_RATIO'], [None, None, 1.5, 18 / 11, 0.75], label='VOLUME_RATIO')
+
+
+def test_volume_ratio_zero_volume_window_is_nan():
+    # volumes 0, 0, 0, 5, 10, period 3
+    #   idx2: window all zero -> 0/0 -> NaN
+    #   idx3: mean 5/3 -> 5/(5/3) = 3      idx4: mean 5 -> 10/5 = 2
+    a = SignalAnalyzer(volume_period=3)
+    df = run_indicators(a, candles_from_closes([10, 11, 12, 13, 14], [0, 0, 0, 5, 10]))
+    assert_series(df['VOLUME_RATIO'], [None, None, None, 3.0, 2.0], label='VOLUME_RATIO zero')
+
+
+def test_volume_ratio_zero_mean_guard_gives_nan_not_inf():
+    # The implementation replaces a window mean of exactly 0 with NaN. 0/0 is
+    # already NaN, so only a NON-zero volume over a zero mean exercises that
+    # guard, which needs signed volumes: -5, 0, 5, 10, 20 with period 3
+    #   idx2: window -5,0,5 -> mean 0, volume 5 -> would be inf; guarded to NaN
+    #   idx3: window 0,5,10 -> mean 5   -> 10/5 = 2
+    #   idx4: window 5,10,20 -> mean 35/3 -> 20*3/35 = 12/7
+    a = SignalAnalyzer(volume_period=3)
+    df = run_indicators(a, candles_from_closes([10, 11, 12, 13, 14], [-5, 0, 5, 10, 20]))
+    assert_series(df['VOLUME_RATIO'], [None, None, None, 2.0, 12 / 7], label='VOLUME_RATIO guard')
+    assert not np.isinf(df['VOLUME_RATIO'].to_numpy(dtype=float)).any()
+
+
+def test_volume_ratio_is_all_nan_without_usable_volume():
+    a = SignalAnalyzer(volume_period=3)
+    closes = [10, 11, 12, 13, 14]
+    for volumes in (None, [100] * 5, [0] * 5):  # missing, constant, all zero
+        df = run_indicators(a, candles_from_closes(closes, volumes))
+        assert df['VOLUME_RATIO'].isna().all(), volumes
+
+
+def test_default_period_warmup_and_nan_placement():
+    # With default periods the first valid row (0-based index) of each column is:
+    #   RSI 14 | EMA_FAST 8 (span 9) | EMA_SLOW 20 (span 21) | MACD 25 (slow 26)
+    #   MACD_SIGNAL / MACD_DIFF 33 (25 + signal 9 - 1) | BB 19 | ATR 13 | VOLUME_RATIO 19
+    # Everything before is NaN, everything from there on is a number.
+    closes = [1.0 + 0.01 * i for i in range(60)]
+    volumes = [100 + (i % 7) * 10 for i in range(60)]
+    df = run_indicators(SignalAnalyzer(), candles_from_closes(closes, volumes))
+    first_valid = {'RSI': 14, 'EMA_FAST': 8, 'EMA_SLOW': 20, 'MACD': 25,
+                   'MACD_SIGNAL': 33, 'MACD_DIFF': 33, 'BB_MID': 19, 'BB_HIGH': 19,
+                   'BB_LOW': 19, 'ATR': 13, 'VOLUME_RATIO': 19}
+    for col, first in first_valid.items():
+        assert df[col].iloc[:first].isna().all(), (col, 'NaN expected before', first)
+        assert df[col].iloc[first:].notna().all(), (col, 'valid expected from', first)
+
+
+def test_min_candles_gives_valid_last_two_rows():
+    cols = ['RSI', 'EMA_FAST', 'EMA_SLOW', 'MACD', 'MACD_SIGNAL', 'BB_LOW', 'BB_HIGH', 'ATR']
+    a = SignalAnalyzer()
+    closes = [1.0 + 0.01 * i for i in range(a.min_candles)]
+    df = run_indicators(a, candles_from_closes(closes))
+    assert a.min_candles == 36
+    assert df[cols].iloc[-2:].notna().all().all()
+    # one MACD-signal warm-up short: 34 candles leave the previous row NaN
+    short = run_indicators(a, candles_from_closes(closes[:34]))
+    assert np.isnan(short['MACD_SIGNAL'].iloc[-2]) and not np.isnan(short['MACD_SIGNAL'].iloc[-1])
+
+
 if __name__ == '__main__':
     failed = 0
     for name, fn in sorted(globals().items()):
