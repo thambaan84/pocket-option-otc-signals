@@ -227,29 +227,25 @@ class SignalAnalyzer:
         else:
             comp['RSI'] = 'NEUTRAL'
 
-        # EMA: a fresh cross gets full weight, an existing trend half weight
-        if cur['EMA_FAST'] > cur['EMA_SLOW']:
-            crossed = prev['EMA_FAST'] <= prev['EMA_SLOW']
-            vote('buy', W_EMA if crossed else W_EMA / 2)
-            comp['EMA'] = 'BULLISH CROSSOVER' if crossed else 'BULLISH TREND'
-        elif cur['EMA_FAST'] < cur['EMA_SLOW']:
-            crossed = prev['EMA_FAST'] >= prev['EMA_SLOW']
-            vote('sell', W_EMA if crossed else W_EMA / 2)
-            comp['EMA'] = 'BEARISH CROSSOVER' if crossed else 'BEARISH TREND'
+        # EMA: votes only on a fresh crossover (no vote for an ongoing trend)
+        if cur['EMA_FAST'] > cur['EMA_SLOW'] and prev['EMA_FAST'] <= prev['EMA_SLOW']:
+            vote('buy', W_EMA)
+            comp['EMA'] = 'BULLISH CROSSOVER'
+        elif cur['EMA_FAST'] < cur['EMA_SLOW'] and prev['EMA_FAST'] >= prev['EMA_SLOW']:
+            vote('sell', W_EMA)
+            comp['EMA'] = 'BEARISH CROSSOVER'
         else:
-            comp['EMA'] = 'FLAT'
+            comp['EMA'] = 'NO CROSSOVER'
 
-        # MACD: same full/half logic
-        if cur['MACD'] > cur['MACD_SIGNAL']:
-            crossed = prev['MACD'] <= prev['MACD_SIGNAL']
-            vote('buy', W_MACD if crossed else W_MACD / 2)
-            comp['MACD'] = 'BULLISH CROSSOVER' if crossed else 'BULLISH TREND'
-        elif cur['MACD'] < cur['MACD_SIGNAL']:
-            crossed = prev['MACD'] >= prev['MACD_SIGNAL']
-            vote('sell', W_MACD if crossed else W_MACD / 2)
-            comp['MACD'] = 'BEARISH CROSSOVER' if crossed else 'BEARISH TREND'
+        # MACD: votes only on a fresh signal-line crossover
+        if cur['MACD'] > cur['MACD_SIGNAL'] and prev['MACD'] <= prev['MACD_SIGNAL']:
+            vote('buy', W_MACD)
+            comp['MACD'] = 'BULLISH CROSSOVER'
+        elif cur['MACD'] < cur['MACD_SIGNAL'] and prev['MACD'] >= prev['MACD_SIGNAL']:
+            vote('sell', W_MACD)
+            comp['MACD'] = 'BEARISH CROSSOVER'
         else:
-            comp['MACD'] = 'FLAT'
+            comp['MACD'] = 'NO CROSSOVER'
 
         # Bollinger Bands (mean reversion)
         if cur['close'] < cur['BB_LOW']:

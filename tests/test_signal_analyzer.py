@@ -73,11 +73,61 @@ def test_single_indicator_is_not_a_full_signal():
 
 
 def test_tie_is_neutral():
-    # sell: EMA trend 0.15 + MACD trend 0.10 = 0.25 ; buy: RSI oversold 0.25
-    cur = {'RSI': 20.0, 'EMA_FAST': 0.99, 'EMA_SLOW': 1.0, 'MACD': -0.1, 'MACD_SIGNAL': 0.0}
-    prev = {'EMA_FAST': 0.99, 'EMA_SLOW': 1.0, 'MACD': -0.1, 'MACD_SIGNAL': 0.0}
+    # buy : RSI oversold 0.25 + close below lower band 0.15            = 0.40
+    # sell: EMA bearish crossover 0.30 + high-volume down candle 0.10  = 0.40
+    cur = {'close': 0.8, 'RSI': 20.0, 'BB_LOW': 0.9, 'VOLUME_RATIO': 2.0,
+           'EMA_FAST': 0.99, 'EMA_SLOW': 1.0}
+    prev = {'close': 1.0, 'EMA_FAST': 1.01, 'EMA_SLOW': 1.0}
     res = SignalAnalyzer().generate_signals(make_df(cur, prev))
+    assert res['buy_score'] == res['sell_score'] == 0.4, res
     assert res['signal'] == 'NEUTRAL' and res['direction'] is None
+
+
+def test_existing_bullish_trend_gives_zero_votes():
+    # fast stays above slow and MACD stays above its signal on both candles
+    cur = {'EMA_FAST': 1.01, 'EMA_SLOW': 1.0, 'MACD': 0.1, 'MACD_SIGNAL': 0.0}
+    prev = {'EMA_FAST': 1.02, 'EMA_SLOW': 1.0, 'MACD': 0.2, 'MACD_SIGNAL': 0.0}
+    res = SignalAnalyzer().generate_signals(make_df(cur, prev))
+    assert res['buy_score'] == 0 and res['sell_score'] == 0, res
+    assert res['components']['EMA'] == 'NO CROSSOVER'
+    assert res['components']['MACD'] == 'NO CROSSOVER'
+    assert res['signal'] == 'NEUTRAL' and res['direction'] is None
+
+
+def test_existing_bearish_trend_gives_zero_votes():
+    cur = {'EMA_FAST': 0.99, 'EMA_SLOW': 1.0, 'MACD': -0.1, 'MACD_SIGNAL': 0.0}
+    prev = {'EMA_FAST': 0.98, 'EMA_SLOW': 1.0, 'MACD': -0.2, 'MACD_SIGNAL': 0.0}
+    res = SignalAnalyzer().generate_signals(make_df(cur, prev))
+    assert res['buy_score'] == 0 and res['sell_score'] == 0, res
+    assert res['components']['EMA'] == 'NO CROSSOVER'
+    assert res['components']['MACD'] == 'NO CROSSOVER'
+    assert res['signal'] == 'NEUTRAL' and res['direction'] is None
+
+
+def test_fresh_ema_crossovers_vote_full_weight():
+    bull = SignalAnalyzer().generate_signals(make_df(
+        {'EMA_FAST': 1.01, 'EMA_SLOW': 1.0}, {'EMA_FAST': 0.99, 'EMA_SLOW': 1.0}))
+    assert bull['components']['EMA'] == 'BULLISH CROSSOVER'
+    assert bull['buy_score'] == 0.3 and bull['sell_score'] == 0
+    assert bull['signal'] == 'WEAK_BUY' and bull['direction'] is None  # 1 vote only
+
+    bear = SignalAnalyzer().generate_signals(make_df(
+        {'EMA_FAST': 0.99, 'EMA_SLOW': 1.0}, {'EMA_FAST': 1.01, 'EMA_SLOW': 1.0}))
+    assert bear['components']['EMA'] == 'BEARISH CROSSOVER'
+    assert bear['sell_score'] == 0.3 and bear['buy_score'] == 0
+    assert bear['signal'] == 'WEAK_SELL' and bear['direction'] is None
+
+
+def test_fresh_macd_crossovers_vote_full_weight():
+    bull = SignalAnalyzer().generate_signals(make_df(
+        {'MACD': 0.1, 'MACD_SIGNAL': 0.0}, {'MACD': -0.1, 'MACD_SIGNAL': 0.0}))
+    assert bull['components']['MACD'] == 'BULLISH CROSSOVER'
+    assert bull['buy_score'] == 0.2 and bull['sell_score'] == 0
+
+    bear = SignalAnalyzer().generate_signals(make_df(
+        {'MACD': -0.1, 'MACD_SIGNAL': 0.0}, {'MACD': 0.1, 'MACD_SIGNAL': 0.0}))
+    assert bear['components']['MACD'] == 'BEARISH CROSSOVER'
+    assert bear['sell_score'] == 0.2 and bear['buy_score'] == 0
 
 
 def test_confirmed_buy_and_sell():
