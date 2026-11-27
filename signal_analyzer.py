@@ -65,6 +65,24 @@ def _atr(high, low, close, period):
     return pd.Series(atr, index=close.index)
 
 
+def _positive_int(name, value):
+    """Return `value` as an int, or raise ValueError. Booleans are rejected."""
+    if (isinstance(value, bool) or not isinstance(value, (int, np.integer))
+            or value <= 0):
+        raise ValueError(f"{name} must be a positive integer (got {value!r})")
+    return int(value)
+
+
+def _positive_finite_number(name, value):
+    """Return `value` unchanged, or raise ValueError. Booleans, NaN and inf are rejected."""
+    if (isinstance(value, bool)
+            or not isinstance(value, (int, float, np.integer, np.floating))
+            or not np.isfinite(value) or value <= 0):
+        raise ValueError(
+            f"{name} must be a finite number greater than 0 (got {value!r})")
+    return value
+
+
 class SignalAnalyzer:
     """
     Multi-indicator signal generator.
@@ -78,23 +96,34 @@ class SignalAnalyzer:
       * winning score leads the other side by at least `min_margin`
     Anything weaker is WEAK_BUY / WEAK_SELL (direction is None, the leaning is
     reported in `bias`). Equal scores give NEUTRAL.
+
+    Constructor parameters are validated; an invalid one raises ValueError
+    naming it. All periods and history_size must be positive integers (not
+    bool, float or str), ema_fast < ema_slow, macd_fast < macd_slow, and
+    bb_std must be a finite number > 0.
     """
 
     def __init__(self, rsi_period=14, ema_fast=9, ema_slow=21,
                  macd_fast=12, macd_slow=26, macd_signal=9,
                  bb_period=20, bb_std=2, atr_period=14, volume_period=20,
                  history_size=500):
-        self.rsi_period = rsi_period
-        self.ema_fast = ema_fast
-        self.ema_slow = ema_slow
-        self.macd_fast = macd_fast
-        self.macd_slow = macd_slow
-        self.macd_signal = macd_signal
-        self.bb_period = bb_period
-        self.bb_std = bb_std
-        self.atr_period = atr_period
-        self.volume_period = volume_period
-        self.signals_history = deque(maxlen=history_size)
+        self.rsi_period = _positive_int('rsi_period', rsi_period)
+        self.ema_fast = _positive_int('ema_fast', ema_fast)
+        self.ema_slow = _positive_int('ema_slow', ema_slow)
+        if self.ema_fast >= self.ema_slow:
+            raise ValueError(
+                f"ema_fast ({self.ema_fast}) must be less than ema_slow ({self.ema_slow})")
+        self.macd_fast = _positive_int('macd_fast', macd_fast)
+        self.macd_slow = _positive_int('macd_slow', macd_slow)
+        if self.macd_fast >= self.macd_slow:
+            raise ValueError(
+                f"macd_fast ({self.macd_fast}) must be less than macd_slow ({self.macd_slow})")
+        self.macd_signal = _positive_int('macd_signal', macd_signal)
+        self.bb_period = _positive_int('bb_period', bb_period)
+        self.bb_std = _positive_finite_number('bb_std', bb_std)
+        self.atr_period = _positive_int('atr_period', atr_period)
+        self.volume_period = _positive_int('volume_period', volume_period)
+        self.signals_history = deque(maxlen=_positive_int('history_size', history_size))
 
     @property
     def min_candles(self):

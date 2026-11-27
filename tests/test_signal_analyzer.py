@@ -286,6 +286,102 @@ def test_atr_needs_a_full_period_before_first_value():
     assert df['ATR'].isna().all()
 
 
+# ---------------------------------------------------------------------------
+# Constructor validation tests
+# ---------------------------------------------------------------------------
+
+INT_PARAMS = ('rsi_period', 'ema_fast', 'ema_slow', 'macd_fast', 'macd_slow',
+              'macd_signal', 'bb_period', 'atr_period', 'volume_period')
+
+
+def assert_rejected(param, value):
+    """Constructing with param=value must raise a ValueError naming the param."""
+    try:
+        SignalAnalyzer(**{param: value})
+    except ValueError as e:
+        assert param in str(e), f'message does not name {param}: {e}'
+        return
+    raise AssertionError(f'{param}={value!r} was accepted')
+
+
+def test_zero_and_negative_periods_rejected():
+    for param in INT_PARAMS + ('history_size',):
+        for bad in (0, -1, -14):
+            assert_rejected(param, bad)
+
+
+def test_float_and_string_periods_rejected():
+    for param in INT_PARAMS + ('history_size',):
+        for bad in (14.0, 2.5, '14', 'abc', None):
+            assert_rejected(param, bad)
+
+
+def test_boolean_periods_rejected():
+    for param in INT_PARAMS + ('history_size',):
+        for bad in (True, False):
+            assert_rejected(param, bad)
+    assert_rejected('bb_std', True)
+
+
+def test_invalid_ema_ordering_rejected():
+    for fast, slow in ((21, 21), (30, 21)):
+        try:
+            SignalAnalyzer(ema_fast=fast, ema_slow=slow)
+        except ValueError as e:
+            assert 'ema_fast' in str(e) and 'ema_slow' in str(e), str(e)
+        else:
+            raise AssertionError(f'ema_fast={fast}, ema_slow={slow} was accepted')
+
+
+def test_invalid_macd_ordering_rejected():
+    for fast, slow in ((26, 26), (40, 26)):
+        try:
+            SignalAnalyzer(macd_fast=fast, macd_slow=slow)
+        except ValueError as e:
+            assert 'macd_fast' in str(e) and 'macd_slow' in str(e), str(e)
+        else:
+            raise AssertionError(f'macd_fast={fast}, macd_slow={slow} was accepted')
+
+
+def test_invalid_bb_std_rejected():
+    for bad in (0, 0.0, -1, -0.5, float('nan'), float('inf'), float('-inf'),
+                np.nan, np.inf, '2', None):
+        assert_rejected('bb_std', bad)
+
+
+def test_invalid_history_size_rejected():
+    for bad in (0, -5, 2.5, 5.0, '5', None, True):
+        assert_rejected('history_size', bad)
+
+
+def test_valid_custom_configuration():
+    a = SignalAnalyzer(rsi_period=7, ema_fast=5, ema_slow=13, macd_fast=8,
+                       macd_slow=17, macd_signal=5, bb_period=10, bb_std=2.5,
+                       atr_period=7, volume_period=10, history_size=50)
+    assert (a.rsi_period, a.ema_fast, a.ema_slow) == (7, 5, 13)
+    assert (a.macd_fast, a.macd_slow, a.macd_signal) == (8, 17, 5)
+    assert (a.bb_period, a.bb_std, a.atr_period, a.volume_period) == (10, 2.5, 7, 10)
+    assert a.signals_history.maxlen == 50
+    assert a.min_candles == 23  # max(13, 17 + 5, 10, 8, 8) + 1
+    res = a.analyze(make_candles(n=80), 'EURUSD_otc')
+    assert res['signal'] != 'ERROR' and SCHEMA <= set(res), res
+    # numpy integers / floats and an integer bb_std are valid
+    b = SignalAnalyzer(rsi_period=np.int64(14), bb_std=np.float64(2.0), history_size=np.int32(10))
+    assert b.rsi_period == 14 and isinstance(b.rsi_period, int) and b.signals_history.maxlen == 10
+    assert SignalAnalyzer(bb_std=3).bb_std == 3
+
+
+def test_default_configuration_still_works():
+    a = SignalAnalyzer()
+    assert (a.rsi_period, a.ema_fast, a.ema_slow) == (14, 9, 21)
+    assert (a.macd_fast, a.macd_slow, a.macd_signal) == (12, 26, 9)
+    assert (a.bb_period, a.bb_std, a.atr_period, a.volume_period) == (20, 2, 14, 20)
+    assert a.signals_history.maxlen == 500
+    assert a.min_candles == 36
+    res = a.analyze(make_candles(), 'EURUSD_otc')
+    assert res['signal'] != 'ERROR' and SCHEMA <= set(res), res
+
+
 if __name__ == '__main__':
     failed = 0
     for name, fn in sorted(globals().items()):
