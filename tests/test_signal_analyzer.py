@@ -438,13 +438,23 @@ def test_ema_matches_hand_calculated_reference():
     assert_series(df['EMA_SLOW'], [None, None, 11 / 2, 23 / 4, 63 / 8], label='EMA_SLOW')
 
 
-def test_rsi_matches_hand_calculated_wilder_reference():
-    # period 3 (Wilder alpha = 1/3), closes 10, 12, 11, 14, 13, 11
+def test_rsi_matches_hand_calculated_recursive_ewm_reference():
+    # Pins the CURRENT implementation. It is a recursive exponentially weighted
+    # average, NOT the conventional SMA-seeded Wilder RSI (which would start from
+    # the simple mean of the first `period` changes).
+    # avg_gain / avg_loss here are pandas ewm(adjust=False, alpha=1/period) means:
+    # they start from the FIRST observed price change (idx1; idx0 has no change),
+    # then recurse as new = (1 - alpha)*old + alpha*x with alpha = 1/3 for period 3.
+    # They exist from idx1 on, but min_periods=period hides them (NaN) until
+    # `period` changes have been observed, so the first visible RSI is idx3.
+    # closes 10, 12, 11, 14, 13, 11
     # change      -    +2   -1   +3   -1   -2
-    # avg_gain    -    2    4/3  17/9 34/27 68/81   (new = 2/3*old + 1/3*gain)
-    # avg_loss    -    0    1/3  2/9  13/27 80/81   (new = 2/3*old + 1/3*loss)
-    # RSI = 100 * avg_gain / (avg_gain + avg_loss), first value once 3 changes exist
+    # avg_gain    -    2    4/3  17/9 34/27 68/81   (seed = first gain, then 2/3*old + 1/3*gain)
+    # avg_loss    -    0    1/3  2/9  13/27 80/81   (seed = first loss, then 2/3*old + 1/3*loss)
+    # RSI = 100 * avg_gain / (avg_gain + avg_loss); idx0-2 are NaN (warm-up)
     #   idx3: 100*17/19 = 1700/19    idx4: 100*34/47 = 3400/47    idx5: 100*68/148 = 1700/37
+    # (For contrast, SMA seeding at idx3 would give avg_gain 5/3, avg_loss 1/3,
+    #  RSI = 100*5/6 = 83.33, not the 89.47 expected here.)
     a = SignalAnalyzer(rsi_period=3)
     df = run_indicators(a, candles_from_closes([10, 12, 11, 14, 13, 11]))
     assert_series(df['RSI'], [None, None, None, 1700 / 19, 3400 / 47, 1700 / 37], label='RSI')
